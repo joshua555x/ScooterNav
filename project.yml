@@ -1,0 +1,20 @@
+name: ScooterNav
+options:
+  bundleIdPrefix: com.scooternav
+targets:
+  ScooterNav:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - ScooterNav
+    info:
+      path: ScooterNav/Info.plist
+      properties:
+        UILaunchScreen: {}
+        UIBackgroundModes:
+          - location
+          - bluetooth-central
+        NSBluetoothAlwaysUsageDescription: "Connects to your ESP32 scooter display"
+        NSLocationWhenInUseUsageDescription: "Calculates routes and tracks scooter position"
+        NSLocationAlwaysAndWhenInUseUsageDescription: "Streams turn-by-turn navigation while your iPhone is locked"
