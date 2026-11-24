@@ -7,9 +7,10 @@ targets:
     platform: iOS
     deploymentTarget: "16.0"
     sources:
-      - ScooterNav
+      - ScooterNavApp.swift
+      - ContentView.swift
     info:
-      path: ScooterNav/Info.plist
+      path: Info.plist
       properties:
         UILaunchScreen: {}
         UIBackgroundModes:
