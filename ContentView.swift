@@ -119,3 +119,263 @@ final class ScooterNavManager: NSObject, ObservableObject, CLLocationManagerDele
             }
             if chunk.count > 2 {
                 self.writeBLE(chunk)
+            }
+        }
+    }
+
+    // Ramer-Douglas-Peucker polyline simplification
+    private func rdpSimplify(_ points: [CLLocationCoordinate2D], epsilon: Double) -> [CLLocationCoordinate2D] {
+        guard points.count > 2 else { return points }
+        var maxDist = 0.0
+        var index = 0
+        let first = points.first!
+        let last = points.last!
+
+        for i in 1..<(points.count - 1) {
+            let d = perpendicularDistance(points[i], lineStart: first, lineEnd: last)
+            if d > maxDist {
+                maxDist = d
+                index = i
+            }
+        }
+        if maxDist > epsilon {
+            let left = rdpSimplify(Array(points[0...index]), epsilon: epsilon)
+            let right = rdpSimplify(Array(points[index..<points.count]), epsilon: epsilon)
+            return left.dropLast() + right
+        } else {
+            return [first, last]
+        }
+    }
+
+    private func perpendicularDistance(_ p: CLLocationCoordinate2D, lineStart a: CLLocationCoordinate2D, lineEnd b: CLLocationCoordinate2D) -> Double {
+        let dx = b.longitude - a.longitude
+        let dy = b.latitude - a.latitude
+        if dx == 0 && dy == 0 {
+            return hypot(p.longitude - a.longitude, p.latitude - a.latitude)
+        }
+        let num = abs(dy * p.longitude - dx * p.latitude + b.longitude * a.latitude - b.latitude * a.longitude)
+        return num / hypot(dx, dy)
+    }
+
+    // MARK: - Live GPS & Turn-by-Turn Updates
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let loc = locations.last else { return }
+        lastLocation = loc
+
+        guard let route = activeRoute, !steps.isEmpty else { return }
+        guard Date().timeIntervalSince(lastSentTime) >= 0.8 else { return }
+        lastSentTime = Date()
+
+        // Advance step when within 25m of current maneuver start point
+        if currentStepIndex < steps.count - 1 {
+            let stepCoord = steps[currentStepIndex].polyline.coordinate
+            let stepLoc = CLLocation(latitude: stepCoord.latitude, longitude: stepCoord.longitude)
+            if loc.distance(from: stepLoc) < 25 {
+                currentStepIndex += 1
+            }
+        }
+
+        let activeStep = steps[currentStepIndex]
+        let maneuverCoord = activeStep.polyline.coordinate
+        let distToTurn = loc.distance(from: CLLocation(latitude: maneuverCoord.latitude, longitude: maneuverCoord.longitude))
+
+        // Estimate remaining trip distance
+        var remMeters = distToTurn
+        if currentStepIndex + 1 < steps.count {
+            for i in (currentStepIndex + 1)..<steps.count {
+                remMeters += steps[i].distance
+            }
+        }
+        remMeters = min(remMeters, route.distance)
+
+        let dirCode = mapDirectionCode(activeStep.instructions)
+        let stepDistStr = formatDistance(distToTurn)
+        let remDistStr = formatDistance(remMeters)
+        let cleanStreet = activeStep.instructions
+            .replacingOccurrences(of: ",", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let heading = loc.course >= 0 ? loc.course : bearing(from: loc.coordinate, to: maneuverCoord)
+
+        DispatchQueue.main.async {
+            self.currentInstruction = cleanStreet
+            self.nextStepDistance = stepDistStr
+            self.remainingDistance = remDistStr
+        }
+
+        // Format expected by ESP32: "N:lat,lon,heading,DIR,stepDist,street,totalRem"
+        let packet = String(
+            format: "N:%.5f,%.5f,%.1f,%@,%@,%@,%@",
+            loc.coordinate.latitude,
+            loc.coordinate.longitude,
+            heading,
+            dirCode,
+            stepDistStr,
+            cleanStreet.isEmpty ? "Continue" : cleanStreet,
+            remDistStr
+        )
+        writeBLE(packet)
+    }
+
+    private func mapDirectionCode(_ instruction: String) -> String {
+        let lower = instruction.lowercased()
+        if lower.contains("u-turn") { return "UTURN" }
+        if lower.contains("left")   { return "LEFT" }
+        if lower.contains("right")  { return "RIGHT" }
+        return "STRAIGHT"
+    }
+
+    private func formatDistance(_ meters: Double) -> String {
+        if meters < 1000 {
+            let rounded = max(10, Int((meters / 10).rounded()) * 10)
+            return "\(rounded) m"
+        } else {
+            return String(format: "%.1f km", meters / 1000.0)
+        }
+    }
+
+    private func bearing(from a: CLLocationCoordinate2D, to b: CLLocationCoordinate2D) -> Double {
+        let lat1 = a.latitude * .pi / 180
+        let lat2 = b.latitude * .pi / 180
+        let dLon = (b.longitude - a.longitude) * .pi / 180
+        let y = sin(dLon) * cos(lat2)
+        let x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon)
+        let deg = atan2(y, x) * 180 / .pi
+        return (deg + 360).truncatingRemainder(dividingBy: 360)
+    }
+
+    // MARK: - CoreBluetooth Delegates
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        if central.state == .poweredOn {
+            central.scanForPeripherals(withServices: [serviceUUID], options: nil)
+        } else {
+            bleStatus = "Turn on iPhone Bluetooth"
+        }
+    }
+
+    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
+        if peripheral.name == "Scooter Nav Pro" || advertisementData[CBAdvertisementDataLocalNameKey] as? String == "Scooter Nav Pro" {
+            espPeripheral = peripheral
+            espPeripheral?.delegate = self
+            centralManager.stopScan()
+            bleStatus = "Connecting to Scooter Nav Pro..."
+            centralManager.connect(peripheral, options: nil)
+        }
+    }
+
+    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        isConnected = true
+        bleStatus = "Connected to Scooter Nav Pro"
+        peripheral.discoverServices([serviceUUID])
+    }
+
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        isConnected = false
+        rxCharacteristic = nil
+        bleStatus = "Reconnecting..."
+        centralManager.scanForPeripherals(withServices: [serviceUUID], options: nil)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        guard let services = peripheral.services else { return }
+        for service in services where service.uuid == serviceUUID {
+            peripheral.discoverCharacteristics([rxCharUUID], for: service)
+        }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        guard let chars = service.characteristics else { return }
+        for char in chars where char.uuid == rxCharUUID {
+            rxCharacteristic = char
+        }
+    }
+
+    private func writeBLE(_ text: String) {
+        guard let peripheral = espPeripheral,
+              let char = rxCharacteristic,
+              let data = text.data(using: .utf8) else { return }
+        peripheral.writeValue(data, for: char, type: .withoutResponse)
+    }
+}
+
+// MARK: - SwiftUI Screen
+struct ContentView: View {
+    @StateObject private var nav = ScooterNavManager()
+    @State private var query = ""
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 14) {
+                // Connection Status Banner
+                HStack {
+                    Circle()
+                        .fill(nav.isConnected ? Color.green : Color.orange)
+                        .frame(width: 10, height: 10)
+                    Text(nav.bleStatus)
+                        .font(.subheadline.bold())
+                    Spacer()
+                }
+                .padding()
+                .background(Color(.secondarySystemBackground))
+                .cornerRadius(12)
+
+                // Destination Search Bar
+                HStack {
+                    TextField("Enter destination (e.g. MG Road)", text: $query)
+                        .textFieldStyle(.roundedBorder)
+                        .submitLabel(.search)
+                        .onSubmit { nav.searchDestination(query: query) }
+                    Button("Go") {
+                        nav.searchDestination(query: query)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+
+                // Search Results List
+                if !nav.searchResults.isEmpty {
+                    List(nav.searchResults, id: \.self) { item in
+                        Button {
+                            nav.startNavigation(to: item)
+                        } label: {
+                            VStack(alignment: .leading) {
+                                Text(item.name ?? "Destination").font(.headline)
+                                Text(item.placemark.title ?? "").font(.caption).foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                    .listStyle(.plain)
+                }
+
+                // Active Navigation Summary Card
+                if nav.activeRoute != nil {
+                    VStack(spacing: 8) {
+                        Text(nav.nextStepDistance)
+                            .font(.system(size: 38, weight: .bold))
+                            .foregroundColor(.green)
+                        Text(nav.currentInstruction)
+                            .font(.headline)
+                            .multilineTextAlignment(.center)
+                        Text("Remaining: \(nav.remainingDistance)")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+
+                        Button("End Route", role: .destructive) {
+                            nav.stopNavigation()
+                        }
+                        .buttonStyle(.bordered)
+                        .padding(.top, 6)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(Color(.secondarySystemBackground))
+                    .cornerRadius(14)
+                }
+
+                Spacer()
+            }
+            .padding()
+            .navigationTitle("Scooter Nav")
+        }
+    }
+}
+// END OF FILE
